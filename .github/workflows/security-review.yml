@@ -114,6 +114,8 @@ jobs:
           rm -rf "$RUNNER_TEMP/claude-agents"
           git clone --quiet --depth 1 --branch "$AGENTS_REF" https://github.com/reaptor/claude-agents.git "$RUNNER_TEMP/claude-agents"
           npm ci --prefix "$RUNNER_TEMP/claude-agents" --no-audit --no-fund --silent
+          # tsx runs in the checkout; without this it would read the checkout's tsconfig.json.
+          echo "TSX_TSCONFIG_PATH=$RUNNER_TEMP/claude-agents/tsconfig.json" >> "$GITHUB_ENV"
 
       - name: Post the "review paused" comment
         if: steps.pr.outputs.limit == 'true'
