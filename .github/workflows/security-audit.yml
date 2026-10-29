@@ -1,0 +1,103 @@
+name: Security audit
+
+# Claude reads the whole codebase at main (read-only) and the findings are filed
+# as one issue. The issue gets no `claude` label: nothing happens until someone
+# with write access replies with `@claude` and what to do with the findings.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        type: string
+        default: '"ubuntu-latest"'
+      model:
+        type: string
+        default: claude-opus-5-5
+      max-budget-usd:
+        type: string
+        default: "20"
+      timeout-minutes:
+        type: number
+        default: 120
+      agents-ref:
+        type: string
+        default: main
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  audit:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    concurrency:
+      group: security-audit-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Get the review tooling
+        env:
+          AGENTS_REF: ${{ inputs.agents-ref }}
+        run: |
+          rm -rf "$RUNNER_TEMP/claude-agents"
+          git clone --quiet --depth 1 --branch "$AGENTS_REF" https://github.com/reaptor/claude-agents.git "$RUNNER_TEMP/claude-agents"
+          npm ci --prefix "$RUNNER_TEMP/claude-agents" --no-audit --no-fund --silent
+
+      - name: Collect the context and the prompt
+        id: prompt
+        run: |
+          mkdir -p sec-out/context
+          git ls-files > sec-out/context/files.txt
+          cli=("$RUNNER_TEMP/claude-agents/node_modules/.bin/tsx" "$RUNNER_TEMP/claude-agents/security-review/cli.ts")
+          SEC_REPO=${REPO#*/} HEAD_SHA=$(git rev-parse HEAD) SEC_CONTEXT_DIR=sec-out/context \
+            "${cli[@]}" prompt audit "$RUNNER_TEMP/prompt.md"
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "prompt<<PROMPT_EOF"
+            cat "$RUNNER_TEMP/prompt.md"
+            echo "PROMPT_EOF"
+            echo "schema=$("${cli[@]}" schema)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: anthropics/claude-code-action@v1
+        id: claude
+        timeout-minutes: ${{ inputs.timeout-minutes }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          # Reads the checkout and nothing else: no shell, no edits, no web, never .git.
+          claude_args: >-
+            --model ${{ inputs.model }}
+            --restricted
+            --tools Read,Glob,Grep
+            --strict-mcp-config
+            --permission-mode dontAsk
+            --allowedTools "Read(./**)"
+            --disallowedTools "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Skill,Read(./.git),Read(./.git/**)"
+            --max-budget-usd ${{ inputs.max-budget-usd }}
+            --json-schema '${{ steps.prompt.outputs.schema }}'
+
+      - name: File the issue
+        env:
+          HEAD_SHA: ${{ steps.prompt.outputs.sha }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          SEC_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SEC_GH_TOKEN: ${{ github.token }}
+        run: |
+          jq -c '.[]' "$EXECUTION_FILE" > "$RUNNER_TEMP/transcript.jsonl"
+          findings=$(SEC_REPO=${REPO#*/} "$RUNNER_TEMP/claude-agents/node_modules/.bin/tsx" "$RUNNER_TEMP/claude-agents/security-review/cli.ts" \
+            audit-issue "$RUNNER_TEMP/transcript.jsonl" "$RUNNER_TEMP/title.txt" "$RUNNER_TEMP/issue.md")
+          if (( findings > 0 )); then
+            gh issue create -R "$REPO" --title "$(cat "$RUNNER_TEMP/title.txt")" --body-file "$RUNNER_TEMP/issue.md"
+          else
+            echo "No findings; no issue filed."
+          fi

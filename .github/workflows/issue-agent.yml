@@ -1,0 +1,132 @@
+name: Issue agent
+
+# One Claude Code run on an issue or pull request of the calling repository.
+#
+# Started by the caller's own workflow on GitHub events (tag mode):
+#   - an issue labeled `claude`            → implement it as a pull request
+#   - a comment or review with `@claude`   → act on it (on a PR: on the PR's branch)
+# or by another reusable workflow here with a `prompt` and a `pr` (agent mode):
+#   conflicts.yml (merge conflicts with main) and the review workflows (findings).
+#
+# What the agent does is in prompts/issue-agent.md plus the caller's own
+# instructions file; see README.md.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: 'The runner, as JSON: "ubuntu-latest" or ["self-hosted","kontera-mac"]'
+        type: string
+        default: '"ubuntu-latest"'
+      instructions:
+        description: "The caller's instructions for the agent, a path in its repository"
+        type: string
+        required: true
+      setup:
+        description: "Shell command run in the checkout before Claude starts (installs, env files, database)"
+        type: string
+        default: ""
+      model:
+        type: string
+        default: claude-opus-5-5
+      effort:
+        type: string
+        default: medium
+      prompt:
+        description: "A task for Claude (agent mode); empty for tag mode on the triggering event"
+        type: string
+        default: ""
+      pr:
+        description: "With a prompt: the pull request whose branch Claude works on"
+        type: string
+        default: ""
+      allowed-bots:
+        description: "Bots whose events may start a run. The Claude app's own (`claude`) start the issues it files and the fixes after its pushes."
+        type: string
+        default: claude
+      include-comments-by-actor:
+        description: "Only these accounts' comments reach Claude (empty: everyone with access). Set it on public repositories."
+        type: string
+        default: ""
+      timeout-minutes:
+        type: number
+        default: 120
+      agents-ref:
+        description: "The ref of reaptor/claude-agents whose prompts are used"
+        type: string
+        default: main
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  claude:
+    # Tag mode only for what the user asked for; comments by bots (Claude's own
+    # included) never start a run, so a reply that mentions @claude cannot loop.
+    if: >-
+      inputs.prompt != '' ||
+      (github.event_name == 'issues' && github.event.label.name == 'claude') ||
+      ((github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') &&
+        github.event.comment.user.type != 'Bot' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' &&
+        github.event.review.user.type != 'Bot' && contains(github.event.review.body, '@claude'))
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    # One run per issue or PR at a time; a later one waits.
+    concurrency:
+      group: claude-${{ github.repository }}-${{ inputs.pr || github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+      id-token: write
+
+    steps:
+      # The default branch, so the instructions and the setup are main's, never a PR's.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Prepare the agent's instructions
+        env:
+          AGENTS_REF: ${{ inputs.agents-ref }}
+          INSTRUCTIONS: ${{ inputs.instructions }}
+        run: |
+          rm -rf "$RUNNER_TEMP/claude-agents"
+          git clone --quiet --depth 1 --branch "$AGENTS_REF" https://github.com/reaptor/claude-agents.git "$RUNNER_TEMP/claude-agents"
+          cat "$RUNNER_TEMP/claude-agents/prompts/issue-agent.md" "$INSTRUCTIONS" > "$RUNNER_TEMP/claude-system.md"
+
+      # Agent mode does not switch branches itself; tag mode does it for the triggering PR.
+      - name: Check out the pull request's branch
+        if: inputs.prompt != '' && inputs.pr != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr }}
+        run: |
+          read -r branch cross < <(gh pr view "$PR" --json headRefName,isCrossRepository -q '"\(.headRefName) \(.isCrossRepository)"')
+          if [[ $cross != false ]]; then
+            echo "::error::PR #$PR comes from a fork; the agent only works on this repository's branches"
+            exit 1
+          fi
+          git checkout -B "$branch" "origin/$branch"
+
+      - name: Set up the checkout
+        if: inputs.setup != ''
+        run: ${{ inputs.setup }}
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ inputs.prompt }}
+          label_trigger: claude
+          branch_name_template: "{{prefix}}issue-{{entityNumber}}"
+          allowed_bots: ${{ inputs.allowed-bots }}
+          include_comments_by_actor: ${{ inputs.include-comments-by-actor }}
+          claude_args: >-
+            --model ${{ inputs.model }}
+            --effort ${{ inputs.effort }}
+            --permission-mode auto
+            --append-system-prompt-file ${{ runner.temp }}/claude-system.md

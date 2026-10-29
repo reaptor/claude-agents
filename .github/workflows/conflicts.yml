@@ -1,0 +1,88 @@
+name: Merge conflicts
+
+# After a push to main: every open pull request on a `claude/` branch that now
+# conflicts with main gets an agent run (issue-agent.yml) that merges main in
+# and resolves the conflicts, or says on the PR what decision it needs.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        type: string
+        default: '"ubuntu-latest"'
+      instructions:
+        type: string
+        required: true
+      setup:
+        type: string
+        default: ""
+      model:
+        type: string
+        default: claude-opus-5-5
+      effort:
+        type: string
+        default: medium
+      include-comments-by-actor:
+        type: string
+        default: ""
+      agents-ref:
+        type: string
+        default: main
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  find:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    permissions:
+      pull-requests: read
+    outputs:
+      prs: ${{ steps.find.outputs.prs }}
+    steps:
+      # GitHub computes mergeability lazily after a push: ask again while any is UNKNOWN.
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          for _ in 1 2 3 4 5 6; do
+            prs=$(gh pr list -R "$REPO" --state open --limit 100 \
+              --json number,headRefName,isCrossRepository,mergeable \
+              -q '[.[] | select((.headRefName | startswith("claude/")) and (.isCrossRepository | not))]')
+            [[ $(jq '[.[] | select(.mergeable == "UNKNOWN")] | length' <<< "$prs") == 0 ]] && break
+            sleep 20
+          done
+          conflicting=$(jq -c '[.[] | select(.mergeable == "CONFLICTING") | .number | tostring]' <<< "$prs")
+          echo "Conflicting: $conflicting"
+          echo "prs=$conflicting" >> "$GITHUB_OUTPUT"
+
+  resolve:
+    needs: find
+    if: needs.find.outputs.prs != '[]'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        pr: ${{ fromJSON(needs.find.outputs.prs) }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+      id-token: write
+    uses: reaptor/claude-agents/.github/workflows/issue-agent.yml@main
+    with:
+      runs-on: ${{ inputs.runs-on }}
+      instructions: ${{ inputs.instructions }}
+      setup: ${{ inputs.setup }}
+      model: ${{ inputs.model }}
+      effort: ${{ inputs.effort }}
+      include-comments-by-actor: ${{ inputs.include-comments-by-actor }}
+      agents-ref: ${{ inputs.agents-ref }}
+      pr: ${{ matrix.pr }}
+      prompt: >-
+        Pull request #${{ matrix.pr }} conflicts with main after ${{ github.sha }} was pushed there.
+        Follow "Task: resolve merge conflicts" in your instructions.
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

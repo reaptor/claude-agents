@@ -1,0 +1,230 @@
+name: Security review
+
+# Claude reads a pull request (read-only: Read, Glob and Grep, no shell, no
+# network) for security problems. Every reviewed commit gets a
+# `security-review` commit status; findings are posted as one PR comment.
+# On a `claude/` branch the findings then go straight to the issue agent.
+# After `max-rounds` comments with findings a PR is no longer reviewed on
+# every push; `force` (a run by hand) reviews it anyway.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        type: string
+        default: '"ubuntu-latest"'
+      pr:
+        description: "The pull request (for a run by hand); default: the triggering one"
+        type: string
+        default: ""
+      force:
+        description: "Review even a draft, a `security-skip` PR or one past the round limit"
+        type: boolean
+        default: false
+      max-rounds:
+        type: number
+        default: 3
+      model:
+        type: string
+        default: claude-opus-5-5
+      max-budget-usd:
+        type: string
+        default: "3"
+      timeout-minutes:
+        type: number
+        default: 30
+      # For the fix run on `claude/` branches (issue-agent.yml); no fix without instructions.
+      instructions:
+        type: string
+        default: ""
+      setup:
+        type: string
+        default: ""
+      effort:
+        type: string
+        default: medium
+      include-comments-by-actor:
+        type: string
+        default: ""
+      agents-ref:
+        type: string
+        default: main
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  review:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    concurrency:
+      group: security-review-${{ github.repository }}-${{ inputs.pr || github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+      id-token: write
+    outputs:
+      findings: ${{ steps.comment.outputs.findings }}
+      comment: ${{ steps.comment.outputs.url }}
+      pr: ${{ steps.pr.outputs.pr }}
+      branch: ${{ steps.pr.outputs.branch }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Decide whether to review
+        id: pr
+        env:
+          PR: ${{ inputs.pr || github.event.pull_request.number }}
+          FORCE: ${{ inputs.force }}
+          MAX_ROUNDS: ${{ inputs.max-rounds }}
+        run: |
+          [[ $PR =~ ^[1-9][0-9]*$ ]] || { echo "::error::No pull request"; exit 1; }
+          info=$(gh pr view "$PR" -R "$REPO" --json state,isDraft,isCrossRepository,headRefOid,headRefName,labels,comments)
+          {
+            echo "pr=$PR"
+            echo "sha=$(jq -r .headRefOid <<< "$info")"
+            echo "branch=$(jq -r .headRefName <<< "$info")"
+          } >> "$GITHUB_OUTPUT"
+          skip() { echo "Not reviewing PR #$PR: $1"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          [[ $(jq -r .state <<< "$info") == OPEN ]] || skip "it is not open"
+          # Fork PRs get no secrets, and their code never runs here.
+          [[ $(jq -r .isCrossRepository <<< "$info") == false ]] || skip "it comes from a fork"
+          if [[ $FORCE != true ]]; then
+            [[ $(jq -r .isDraft <<< "$info") == false ]] || skip "it is a draft"
+            jq -e '.labels | any(.name == "security-skip")' <<< "$info" >/dev/null && skip "it is labelled security-skip"
+            rounds=$(jq '[.comments[] | select(.body | contains("<!-- security-review -->"))] | length' <<< "$info")
+            if (( rounds >= MAX_ROUNDS )); then
+              if ! jq -e '.comments | any(.body | contains("<!-- security-review-limit -->"))' <<< "$info" >/dev/null; then
+                echo "limit=true" >> "$GITHUB_OUTPUT"
+              fi
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Get the review tooling
+        if: steps.pr.outputs.run == 'true' || steps.pr.outputs.limit == 'true'
+        env:
+          AGENTS_REF: ${{ inputs.agents-ref }}
+        run: |
+          rm -rf "$RUNNER_TEMP/claude-agents"
+          git clone --quiet --depth 1 --branch "$AGENTS_REF" https://github.com/reaptor/claude-agents.git "$RUNNER_TEMP/claude-agents"
+          npm ci --prefix "$RUNNER_TEMP/claude-agents" --no-audit --no-fund --silent
+
+      - name: Post the "review paused" comment
+        if: steps.pr.outputs.limit == 'true'
+        env:
+          PR: ${{ steps.pr.outputs.pr }}
+          MAX_ROUNDS: ${{ inputs.max-rounds }}
+        run: |
+          SEC_REPO=${REPO#*/} "$RUNNER_TEMP/claude-agents/node_modules/.bin/tsx" "$RUNNER_TEMP/claude-agents/security-review/cli.ts" \
+            limit-comment "$MAX_ROUNDS" "$RUNNER_TEMP/limit.md"
+          gh api "repos/$REPO/issues/$PR/comments" -F body=@"$RUNNER_TEMP/limit.md" >/dev/null
+
+      - uses: actions/checkout@v7
+        if: steps.pr.outputs.run == 'true'
+        with:
+          ref: ${{ steps.pr.outputs.sha }}
+          persist-credentials: false
+
+      - name: Collect the context and the prompt
+        if: steps.pr.outputs.run == 'true'
+        id: prompt
+        env:
+          PR: ${{ steps.pr.outputs.pr }}
+          HEAD_SHA: ${{ steps.pr.outputs.sha }}
+        run: |
+          mkdir -p sec-out/context
+          gh pr view "$PR" -R "$REPO" --json number,title,body,author,headRefName,baseRefName,url,files > sec-out/context/pr.json
+          # Very large diffs are refused by the API; Claude can still read the files.
+          gh pr diff "$PR" -R "$REPO" > "$RUNNER_TEMP/full.patch" ||
+            echo "(The diff is too large to fetch; see the changed files in pr.json.)" > "$RUNNER_TEMP/full.patch"
+          head -c 400000 "$RUNNER_TEMP/full.patch" > sec-out/context/diff.patch
+          gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            -q '.[] | select(.body | contains("<!-- security-review -->")) | .body + "\n\n---\n"' > sec-out/context/previous.md
+          cli=("$RUNNER_TEMP/claude-agents/node_modules/.bin/tsx" "$RUNNER_TEMP/claude-agents/security-review/cli.ts")
+          SEC_REPO=${REPO#*/} SEC_CONTEXT_DIR=sec-out/context "${cli[@]}" prompt pr "$RUNNER_TEMP/prompt.md"
+          {
+            echo "prompt<<PROMPT_EOF"
+            cat "$RUNNER_TEMP/prompt.md"
+            echo "PROMPT_EOF"
+            echo "schema=$("${cli[@]}" schema)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: anthropics/claude-code-action@v1
+        if: steps.pr.outputs.run == 'true'
+        id: claude
+        timeout-minutes: ${{ inputs.timeout-minutes }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          allowed_bots: claude
+          # Reads the checkout and nothing else: no shell, no edits, no web, never .git.
+          claude_args: >-
+            --model ${{ inputs.model }}
+            --restricted
+            --tools Read,Glob,Grep
+            --strict-mcp-config
+            --permission-mode dontAsk
+            --allowedTools "Read(./**)"
+            --disallowedTools "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Skill,Read(./.git),Read(./.git/**)"
+            --max-budget-usd ${{ inputs.max-budget-usd }}
+            --json-schema '${{ steps.prompt.outputs.schema }}'
+
+      - name: Comment and set the commit status
+        if: steps.pr.outputs.run == 'true'
+        id: comment
+        env:
+          PR: ${{ steps.pr.outputs.pr }}
+          HEAD_SHA: ${{ steps.pr.outputs.sha }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          SEC_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SEC_GH_TOKEN: ${{ github.token }}
+        run: |
+          jq -c '.[]' "$EXECUTION_FILE" > "$RUNNER_TEMP/transcript.jsonl"
+          result=$(SEC_REPO=${REPO#*/} "$RUNNER_TEMP/claude-agents/node_modules/.bin/tsx" "$RUNNER_TEMP/claude-agents/security-review/cli.ts" \
+            comment "$RUNNER_TEMP/transcript.jsonl" "$RUNNER_TEMP/comment.md")
+          findings=${result%% *} description=${result#* }
+          echo "findings=$findings" >> "$GITHUB_OUTPUT"
+          if (( findings > 0 )); then
+            url=$(gh api "repos/$REPO/issues/$PR/comments" -F body=@"$RUNNER_TEMP/comment.md" -q .url)
+            echo "url=$url" >> "$GITHUB_OUTPUT"
+            state=failure
+          else
+            state=success
+          fi
+          gh api "repos/$REPO/statuses/$HEAD_SHA" -f context=security-review -f state=$state \
+            -f description="$description" -f target_url="$SEC_RUN_URL" >/dev/null
+
+  fix:
+    needs: review
+    if: >-
+      inputs.instructions != '' &&
+      needs.review.outputs.findings > 0 &&
+      startsWith(needs.review.outputs.branch, 'claude/')
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+      id-token: write
+    uses: reaptor/claude-agents/.github/workflows/issue-agent.yml@main
+    with:
+      runs-on: ${{ inputs.runs-on }}
+      instructions: ${{ inputs.instructions }}
+      setup: ${{ inputs.setup }}
+      model: ${{ inputs.model }}
+      effort: ${{ inputs.effort }}
+      include-comments-by-actor: ${{ inputs.include-comments-by-actor }}
+      agents-ref: ${{ inputs.agents-ref }}
+      pr: ${{ needs.review.outputs.pr }}
+      prompt: >-
+        The security review posted findings on pull request #${{ needs.review.outputs.pr }}
+        in the comment ${{ needs.review.outputs.comment }}.
+        Follow "Task: fix review findings" in your instructions.
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

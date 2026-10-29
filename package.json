@@ -1,0 +1,17 @@
+{
+  "name": "claude-agents",
+  "private": true,
+  "description": "Reusable GitHub workflows that run Claude Code agents for reaptor's repositories",
+  "type": "commonjs",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "actionlint"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.10",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  }
+}
