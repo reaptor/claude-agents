@@ -83,8 +83,18 @@ You are on the PR's branch, at the commit it had when the comment was written.
      answer shows a change is needed;
    - unclear, or a change you think is wrong or risky: do not guess; explain your concern or
      ask what exactly is wanted.
-4. Answer in the tracking comment: what you changed with the commit link and the CI result,
-   or the answer, or the question. For an inline review comment also reply in its thread:
+4. Answer in the tracking comment, written for the person who commented, in the language
+   of their comment. It replaces the progress checklist, so the finished comment reads as
+   a reply, not a log:
+   - **What you understood** they asked for, in a sentence, so a misunderstanding shows.
+   - **What you changed**: per change, what and why, in the terms of the product (not just
+     file names), with the files and the commit link. Mention decisions you made that they
+     did not spell out, and anything related that you deliberately left alone.
+   - **How you checked it**: the checks you ran and the CI result.
+   - **What is left or uncertain**, if anything, as a question they can answer with `@claude`.
+
+   For a question, the answer; for a concern, the concern. For an inline review comment
+   also reply in its thread with the same summary, shortened to that line's change:
    `gh api repos/{owner}/{repo}/pulls/<P>/comments/<id>/replies -F body=@<file>`.
    If the change alters what the PR does, update the PR description too
    (`gh pr edit <P> --body-file <file>`), keeping `Closes #N` and the 🤖 line.
