@@ -61,15 +61,19 @@ on:
 
 jobs:
   claude:
-    # Tag mode only for what the user asked for; comments by bots (Claude's own
-    # included) never start a run, so a reply that mentions @claude cannot loop.
+    # Tag mode only for what someone with write access asked for (the action checks
+    # that again; this keeps strangers' comments on a public repo from starting a
+    # job at all). Comments by bots, Claude's own included, never start a run, so a
+    # reply that mentions @claude cannot loop.
     if: >-
       inputs.prompt != '' ||
       (github.event_name == 'issues' && github.event.label.name == 'claude') ||
       ((github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') &&
-        github.event.comment.user.type != 'Bot' && contains(github.event.comment.body, '@claude')) ||
+        github.event.comment.user.type != 'Bot' && contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
       (github.event_name == 'pull_request_review' &&
-        github.event.review.user.type != 'Bot' && contains(github.event.review.body, '@claude'))
+        github.event.review.user.type != 'Bot' && contains(github.event.review.body, '@claude') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association))
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     # One run per issue or PR at a time; a later one waits.
